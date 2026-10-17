@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Light Visualiser</title>
+<style>
+  :root { --bg:#111; --panel:#1c1c1f; --fg:#eee; --muted:#999; --accent:#ffb84d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px system-ui, sans-serif; display:flex; height:100vh; }
+  aside { width:260px; padding:16px; background:var(--panel); overflow-y:auto; display:flex; flex-direction:column; gap:14px; }
+  main { flex:1; display:flex; align-items:center; justify-content:center; padding:16px; min-width:0; }
+  canvas { max-width:100%; max-height:100%; touch-action:none; cursor:crosshair; }
+  h1 { font-size:16px; margin:0; }
+  label { display:flex; flex-direction:column; gap:4px; color:var(--muted); }
+  input[type=range] { width:100%; }
+  .row { display:flex; gap:6px; }
+  button { flex:1; padding:8px; border:1px solid #333; background:#26262a; color:var(--fg); border-radius:6px; cursor:pointer; }
+  button.on { border-color:var(--accent); color:var(--accent); }
+  fieldset { border:1px solid #333; border-radius:6px; display:flex; flex-direction:column; gap:10px; }
+  fieldset:disabled { opacity:.4; }
+  [hidden] { display:none !important; }
+  .stack { display:flex; flex-direction:column; gap:10px; max-width:100%; }
+  select { padding:6px; background:#26262a; color:var(--fg); border:1px solid #333; border-radius:6px; }
+  video { max-width:100%; max-height:75vh; border-radius:8px; background:#000; }
+  #drop { color:var(--muted); text-align:center; border:2px dashed #333; border-radius:12px; padding:60px 30px; }
+  .hint { color:var(--muted); font-size:12px; line-height:1.4; margin:0; }
+  @media (max-width: 700px) { body { flex-direction:column-reverse; height:auto; } aside { width:100%; } main { min-height:50vh; } }
+</style>
+</head>
+<body>
+<aside>
+  <h1>Light Visualiser</h1>
+  <label>Photo <input type="file" id="file" accept="image/*"></label>
+  <button id="camBtn">Use camera</button>
+
+  <div>
+    <div class="row">
+      <button id="modeSpot" class="on">Spot / bulb</button>
+      <button id="modeBack">Backlight box</button>
+      <button id="modeFree">Backlight freehand</button>
+    </div>
+    <p class="hint" id="modeHint"></p>
+  </div>
+
+  <label>Room darkness <input type="range" id="dark" min="0" max="0.95" step="0.01" value="0.6"></label>
+  <label>Bloom (visible glow) <input type="range" id="bloom" min="0" max="1" step="0.01" value="0.5"></label>
+
+  <fieldset id="edit" disabled>
+    <legend>Selected light</legend>
+    <label>Colour <input type="color" id="color" value="#ffcf8a"></label>
+    <label>Intensity <input type="range" id="intensity" min="0.05" max="1.5" step="0.01" value="0.9"></label>
+    <label>Size / spread <input type="range" id="size" min="10" max="600" step="1" value="200"></label>
+    <div id="flowCtl" class="stack">
+      <label>Effect
+        <select id="effect">
+          <option value="static">Static</option>
+          <option value="rainbow">Flowing rainbow</option>
+          <option value="chase">Flowing chase (colour)</option>
+        </select>
+      </label>
+      <label>Flow speed <input type="range" id="speed" min="0.1" max="3" step="0.05" value="1"></label>
+    </div>
+    <button id="del">Delete light</button>
+  </fieldset>
+
+  <div class="row">
+    <button id="clear">Clear all</button>
+    <button id="save">Save PNG</button>
+  </div>
+  <button id="saveLight">Save light only (transparent PNG)</button>
+  <p class="hint">Click a light to select it, drag to move. Delete key removes it.</p>
+</aside>
+
+<main>
+  <div id="drop">Choose or drop a photo to start</div>
+  <canvas id="cv" hidden></canvas>
+  <div id="camBox" class="stack" hidden>
+    <video id="video" autoplay playsinline muted></video>
+    <div class="row"><button id="snap">Take photo</button><button id="camCancel">Cancel</button></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const cv = $('cv'), ctx = cv.getContext('2d');
+const glowCv = document.createElement('canvas'), gctx = glowCv.getContext('2d');
+const litCv = document.createElement('canvas'), lctx = litCv.getContext('2d');
+const MAX = 1600; // ponytail: photos downscaled to 1600px for smooth redraws; raise if exports need full res
+
+let img = null, lights = [], sel = null, mode = 'spot', drag = null;
+
+const HINTS = {
+  spot: 'Click on the photo to place a bulb / spotlight in front of the scene.',
+  back: 'Drag a box over an object (TV, mirror, frame, headboard). Light glows out from behind its edges.',
+  free: 'Draw around any shape (plant, arch mirror, curved headboard). Light glows out from behind the outline.'
+};
+
+function setMode(m) {
+  mode = m;
+  $('modeSpot').classList.toggle('on', m === 'spot');
+  $('modeBack').classList.toggle('on', m === 'back');
+  $('modeFree').classList.toggle('on', m === 'free');
+  $('modeHint').textContent = HINTS[m];
+}
+
+// Outline of a backlit object: a box (x,y,w,h) or a freehand loop (pts relative to x,y).
+function shapePath(L) {
+  const p = new Path2D();
+  if (L.pts) {
+    p.moveTo(L.x + L.pts[0][0], L.y + L.pts[0][1]);
+    for (const [dx, dy] of L.pts) p.lineTo(L.x + dx, L.y + dy);
+    p.closePath();
+  } else p.rect(L.x, L.y, L.w, L.h);
+  return p;
+}
+
+function loadFile(f) {
+  if (!f || !f.type.startsWith('image/')) return;
+  const im = new Image();
+  im.onload = () => {
+    const s = Math.min(1, MAX / Math.max(im.width, im.height));
+    for (const c of [cv, glowCv, litCv]) { c.width = Math.round(im.width * s); c.height = Math.round(im.height * s); }
+    img = im; lights = []; select(null);
+    showView();
+    draw();
+  };
+  im.src = URL.createObjectURL(f);
+}
+
+function centre(L) {
+  if (!L.pts) return [L.x + L.w / 2, L.y + L.h / 2];
+  const n = L.pts.length;
+  return [L.x + L.pts.reduce((s, q) => s + q[0], 0) / n, L.y + L.pts.reduce((s, q) => s + q[1], 0) / n];
+}
+
+// Halo paint: plain colour, or a conic gradient rotating around the object so colour flows along its outline.
+function haloStyle(L, t) {
+  if (L.effect === 'static') return L.color;
+  const [cx, cy] = centre(L);
+  const g = gctx.createConicGradient(t / 1000 * L.speed, cx, cy);
+  if (L.effect === 'rainbow') {
+    for (let i = 0; i <= 6; i++) g.addColorStop(i / 6, `hsl(${i * 60}, 100%, 60%)`);
+  } else {
+    const N = 4; // bright pulses chasing around the outline
+    for (let i = 0; i < N; i++) { g.addColorStop(i / N, L.color); g.addColorStop((i + 0.5) / N, L.color + '10'); }
+    g.addColorStop(1, L.color);
+  }
+  return g;
+}
+
+// Paint each light's raw colour shape into the glow layer (transparent background).
+function paintGlow(t = performance.now()) {
+  gctx.clearRect(0, 0, glowCv.width, glowCv.height);
+  gctx.globalCompositeOperation = 'lighter';
+  const backs = lights.filter(L => L.type === 'back');
+
+  // Backlight halos: blurred, slightly grown outlines.
+  for (const L of backs) {
+    const shape = shapePath(L);
+    gctx.globalAlpha = Math.min(1, L.intensity);
+    gctx.filter = `blur(${L.size / 3}px)`;
+    gctx.fillStyle = gctx.strokeStyle = haloStyle(L, t);
+    gctx.lineWidth = L.size / 3; gctx.lineJoin = 'round';
+    gctx.fill(shape); gctx.stroke(shape);
+    gctx.filter = 'none';
+  }
+  // Every backlit object is opaque: it blocks all halos, including where shapes overlap.
+  gctx.globalAlpha = 1;
+  gctx.globalCompositeOperation = 'destination-out';
+  for (const L of backs) gctx.fill(shapePath(L));
+
+  // Spots sit in front of the scene, so they still light objects.
+  gctx.globalCompositeOperation = 'lighter';
+  for (const L of lights) {
+    if (L.type !== 'spot') continue;
+    gctx.globalAlpha = Math.min(1, L.intensity);
+    const g = gctx.createRadialGradient(L.x, L.y, 0, L.x, L.y, L.size);
+    g.addColorStop(0, L.color);
+    g.addColorStop(0.15, L.color + 'cc');
+    g.addColorStop(1, L.color + '00');
+    gctx.fillStyle = g;
+    gctx.fillRect(L.x - L.size, L.y - L.size, L.size * 2, L.size * 2);
+  }
+  gctx.globalAlpha = 1;
+  gctx.globalCompositeOperation = 'source-over';
+}
+
+function draw(overlay = true) {
+  if (!img) return;
+  const W = cv.width, H = cv.height;
+  paintGlow();
+
+  // 1. Dimmed room
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.drawImage(img, 0, 0, W, H);
+  ctx.fillStyle = `rgba(0,0,0,${$('dark').value})`;
+  ctx.fillRect(0, 0, W, H);
+
+  // 2. Light falling on surfaces: photo * light map, added on top
+  lctx.globalCompositeOperation = 'source-over';
+  lctx.fillStyle = '#000'; lctx.fillRect(0, 0, W, H);
+  lctx.globalCompositeOperation = 'lighter';
+  lctx.drawImage(glowCv, 0, 0);
+  lctx.globalCompositeOperation = 'multiply';
+  lctx.drawImage(img, 0, 0, W, H);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.drawImage(litCv, 0, 0);
+
+  // 3. Visible glow / bloom
+  ctx.globalCompositeOperation = 'screen';
+  ctx.globalAlpha = +$('bloom').value;
+  ctx.drawImage(glowCv, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+
+  if (overlay && sel) {
+    ctx.strokeStyle = '#fff'; ctx.setLineDash([6, 4]); ctx.lineWidth = 2;
+    ctx.beginPath();
+    if (sel.type === 'spot') ctx.arc(sel.x, sel.y, 12, 0, Math.PI * 2);
+    ctx.stroke();
+    if (sel.type === 'back') ctx.stroke(shapePath(sel));
+    ctx.setLineDash([]);
+  }
+}
+
+let raf = 0;
+const redraw = () => { cancelAnimationFrame(raf); raf = requestAnimationFrame(() => draw()); };
+
+// Keep redrawing every frame while any backlight is flowing.
+(function tick() {
+  if (img && !cv.hidden && lights.some(L => L.type === 'back' && L.effect !== 'static')) draw();
+  requestAnimationFrame(tick);
+})();
+
+const EDIT = ['color', 'intensity', 'size', 'effect', 'speed'];
+
+function select(L) {
+  sel = L;
+  $('edit').disabled = !L;
+  if (L) { for (const id of EDIT) $(id).value = L[id]; $('flowCtl').hidden = L.type !== 'back'; }
+  redraw();
+}
+
+function pos(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * cv.width / r.width, y: (e.clientY - r.top) * cv.height / r.height };
+}
+
+function hit(p) {
+  const grab = 20 * cv.width / cv.getBoundingClientRect().width; // 20 screen px
+  for (let i = lights.length - 1; i >= 0; i--) {
+    const L = lights[i];
+    if (L.type === 'spot' ? Math.hypot(p.x - L.x, p.y - L.y) < grab
+                          : gctx.isPointInPath(shapePath(L), p.x, p.y)) return L;
+  }
+  return null;
+}
+
+const newLight = extra => ({
+  color: $('color').value, intensity: +$('intensity').value, size: +$('size').value,
+  effect: $('effect').value, speed: +$('speed').value, ...extra
+});
+
+cv.addEventListener('pointerdown', e => {
+  cv.setPointerCapture(e.pointerId);
+  const p = pos(e), h = hit(p);
+  if (h) { select(h); drag = { kind: 'move', L: h, dx: p.x - h.x, dy: p.y - h.y }; return; }
+  const L = mode === 'spot' ? newLight({ type: 'spot', x: p.x, y: p.y })
+          : mode === 'back' ? newLight({ type: 'back', x: p.x, y: p.y, w: 0, h: 0 })
+          : newLight({ type: 'back', x: p.x, y: p.y, pts: [[0, 0]] });
+  lights.push(L); select(L);
+  drag = mode === 'spot' ? { kind: 'move', L, dx: 0, dy: 0 }
+       : mode === 'back' ? { kind: 'rect', L, ox: p.x, oy: p.y }
+       : { kind: 'free', L };
+});
+cv.addEventListener('pointermove', e => {
+  if (!drag) return;
+  const p = pos(e), L = drag.L;
+  if (drag.kind === 'move') { L.x = p.x - drag.dx; L.y = p.y - drag.dy; }
+  else if (drag.kind === 'rect') { L.x = Math.min(p.x, drag.ox); L.y = Math.min(p.y, drag.oy); L.w = Math.abs(p.x - drag.ox); L.h = Math.abs(p.y - drag.oy); }
+  else {
+    const [lx, ly] = L.pts[L.pts.length - 1], dx = p.x - L.x, dy = p.y - L.y;
+    if (Math.hypot(dx - lx, dy - ly) > 3) L.pts.push([dx, dy]);
+  }
+  redraw();
+});
+// Throw away shapes too small to be intentional (a stray click in box / freehand mode).
+function tooSmall(L) {
+  if (!L.pts) return L.w < 5 || L.h < 5;
+  const xs = L.pts.map(q => q[0]), ys = L.pts.map(q => q[1]);
+  return L.pts.length < 3 || Math.max(...xs) - Math.min(...xs) < 5 || Math.max(...ys) - Math.min(...ys) < 5;
+}
+cv.addEventListener('pointerup', () => {
+  if ((drag?.kind === 'rect' || drag?.kind === 'free') && tooSmall(drag.L)) { lights.splice(lights.indexOf(drag.L), 1); select(null); }
+  drag = null;
+});
+
+for (const id of EDIT) $(id).addEventListener('input', e => {
+  if (sel) { sel[id] = e.target.type === 'range' ? +e.target.value : e.target.value; redraw(); }
+});
+$('dark').addEventListener('input', redraw);
+$('bloom').addEventListener('input', redraw);
+
+function removeSel() { if (sel) { lights.splice(lights.indexOf(sel), 1); select(null); } }
+$('del').onclick = removeSel;
+document.addEventListener('keydown', e => {
+  if ((e.key === 'Delete' || e.key === 'Backspace') && !['INPUT', 'SELECT'].includes(e.target.tagName)) removeSel();
+});
+$('clear').onclick = () => { lights = []; select(null); };
+function download(canvas, name) {
+  const a = document.createElement('a');
+  a.download = name; a.href = canvas.toDataURL('image/png'); a.click();
+}
+$('save').onclick = () => {
+  if (!img) return;
+  draw(false);
+  download(cv, 'lit-photo.png');
+  draw();
+};
+// Glow layer alone: light colour + alpha, objects already cut out. Layer it over the photo (Screen/Add blend).
+$('saveLight').onclick = () => { if (img) { paintGlow(); download(glowCv, 'light-only.png'); } };
+
+// Camera: live preview, "Take photo" grabs a frame and loads it like an uploaded photo.
+let stream = null;
+function showView() {
+  $('camBox').hidden = !stream;
+  cv.hidden = !!stream || !img;
+  $('drop').hidden = !!stream || !!img;
+}
+function stopCam() { stream?.getTracks().forEach(t => t.stop()); stream = null; showView(); }
+$('camBtn').onclick = async () => {
+  if (!navigator.mediaDevices?.getUserMedia) return alert('Camera not available in this browser (it needs https or a local file).');
+  try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }); }
+  catch (err) { return alert('Could not open camera: ' + err.message); }
+  $('video').srcObject = stream;
+  showView();
+};
+$('camCancel').onclick = stopCam;
+$('snap').onclick = () => {
+  const v = $('video');
+  if (!v.videoWidth) return; // camera not delivering frames yet
+  const c = document.createElement('canvas');
+  c.width = v.videoWidth; c.height = v.videoHeight;
+  c.getContext('2d').drawImage(v, 0, 0);
+  stopCam();
+  c.toBlob(b => loadFile(new File([b], 'camera.jpg', { type: 'image/jpeg' })), 'image/jpeg', 0.92);
+};
+
+$('modeSpot').onclick = () => setMode('spot');
+$('modeBack').onclick = () => setMode('back');
+$('modeFree').onclick = () => setMode('free');
+$('file').addEventListener('change', e => loadFile(e.target.files[0]));
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => { e.preventDefault(); loadFile(e.dataTransfer.files[0]); });
+setMode('spot');
+</script>
+</body>
+</html>
